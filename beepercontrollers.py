@@ -2,6 +2,8 @@ from abc import ABC, abstractmethod
 import asyncio
 import json
 from typing import Optional
+import threading
+import websockets
 
 
 class BeeperController(ABC):
@@ -44,16 +46,20 @@ class BeeperController(ABC):
 
 class WebSocketSoundController(BeeperController):
     """
-    Implementación simple que envía acciones al servidor por WebSocket.
-    Se puede crear sin socket y luego adjuntar ws/loop con attach_transport().
+    Implementación que administra internamente la conexión WebSocket en un hilo
+    y proporciona métodos síncronos para enviar acciones al servidor.
     """
 
-    def __init__(self, ws: Optional[object] = None, loop: Optional[asyncio.AbstractEventLoop] = None):
-        self._ws = ws
-        self._loop = loop
+    def __init__(self, uri: str = "ws://localhost:8765"):
+        self._uri = uri
+        self._ws: Optional[websockets.WebSocketClientProtocol] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._thread: Optional[threading.Thread] = None
+        self._stop_event: Optional[asyncio.Event] = None
+        self._connected = threading.Event()
 
     def attach_transport(self, ws, loop: asyncio.AbstractEventLoop) -> None:
-        """Adjunta el websocket y el event loop (llamar cuando se conecta)."""
+        """Compatibilidad retroactiva (no usada)."""
         self._ws = ws
         self._loop = loop
 
@@ -62,13 +68,66 @@ class WebSocketSoundController(BeeperController):
         self._loop = None
 
     def connect(self) -> None:
-        # La conexión WebSocket la maneja el hilo / cliente; aquí no se abre nada.
-        return
+        """Inicia hilo + event loop y establece la conexión websocket."""
+        if self._thread and self._thread.is_alive():
+            return  # ya conectado / en proceso
+
+        def _run():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            self._loop = loop
+            # crear evento en el mismo loop
+            self._stop_event = asyncio.Event()
+            try:
+                loop.run_until_complete(self._ws_main())
+            finally:
+                # limpieza del loop
+                loop.run_until_complete(loop.shutdown_asyncgens())
+                loop.close()
+                self._loop = None
+                self._stop_event = None
+                self._connected.clear()
+
+        self._thread = threading.Thread(target=_run, daemon=True)
+        self._thread.start()
+        # esperar a que la conexión se establezca (o falle) para que connect sea síncrono
+        self._connected.wait(timeout=5)
 
     def disconnect(self) -> None:
+        """Cierra la conexión y detiene el hilo/loop."""
+        if not self._loop:
+            return
+        try:
+            # señalizar cierre desde el event loop
+            self._loop.call_soon_threadsafe(lambda: self._stop_event.set())
+        except Exception:
+            pass
+        # esperar que el hilo termine
+        if self._thread:
+            self._thread.join(timeout=3)
         self.detach_transport()
 
+    async def _ws_main(self):
+        """Corutina que establece la conexión y espera al event para cerrarla."""
+        try:
+            async with websockets.connect(self._uri) as ws:
+                self._ws = ws
+                self._connected.set()
+                print("WebSocketSoundController: conectado a", self._uri)
+                # Mantener la conexión abierta hasta que _stop_event sea seteado
+                try:
+                    await self._stop_event.wait()
+                finally:
+                    # opcional: enviar mensaje de cierre si hace falta
+                    pass
+        except Exception as e:
+            print("WebSocketSoundController: error en conexión:", e)
+        finally:
+            self._ws = None
+            print("WebSocketSoundController: desconectado")
+
     def _send(self, action: str) -> None:
+        """Envía acción al servidor de forma segura (no bloqueante)."""
         if not (self._ws and self._loop):
             print(f"⚠️ No transport available to send action '{action}'")
             return
